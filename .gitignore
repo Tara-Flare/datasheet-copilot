@@ -1,0 +1,34 @@
+# 虚拟环境
+.venv/
+venv/
+
+# 密钥和环境变量
+.env
+.env.*
+!.env.example
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 构建文件
+build/
+dist/
+*.egg-info/
+
+# Docling 模型
+docling-models/
+docling-models.tar.gz
+
+# PDF 样本、缓存和实验产物
+data/samples/*.pdf
+data/cache/
+data/outputs/
+
+# 日志及系统文件
+*.log
+.DS_Store
+.ipynb_checkpoints/
