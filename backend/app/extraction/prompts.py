@@ -41,31 +41,94 @@ SYSTEM_PROMPT = """
 """
 
 
+LOGICAL_INPUT_INSTRUCTION_VERSION = "b3.4b-v1"
+
 LOGICAL_INPUT_INSTRUCTION = """
 本次输入中的部分或全部表格来自 Logical 恢复结果。
+columns 含 logical_row_id、source_row_indices、
+source_cell_ids；rows 每行对应一个逻辑行。
 
-这些表格的 columns 中包含 logical_row_id、
-source_row_indices、source_cell_ids 等字段；
-rows 的每一行对应一个逻辑行。
-
-与 Flat 表格不同，必须遵守：
-
-1. evidence.logical_row_id 必须原样复制该逻辑行的
-   logical_row_id，不得改写、拼接或编造。
-2. evidence.row_index 必须使用该逻辑行的 primary
-   row_index（即 row_indices 数组中与 rows 对应位置
-   的值），它不是 logical_row_id 中的数字。
-3. evidence.source_row_indices 必须复制该逻辑行的
-   source_row_indices，保留全部原始行号。
-4. evidence.table_id 和 evidence.page 必须来自该逻辑行。
-5. 多个逻辑行可能共享同一个原始 row_index。
-   例如 t9.p30 和 t9.p31 都可能引用原始 row 30，
-   但它们是两条不同参数记录，必须按
+一、来源字段
+1. evidence.logical_row_id 必须原样复制，不得改写、
+   拼接或编造。
+2. evidence.row_index 使用该逻辑行的 primary row_index
+   （row_indices 中对应位置的值），不是 logical_row_id
+   中的数字。
+3. evidence.source_row_indices 复制全部原始行号。
+4. evidence.table_id 和 evidence.page 来自该逻辑行。
+5. 多条逻辑行可共享同一原始 row_index，必须按
    logical_row_id 分别输出，不得合并。
-6. 如果无法确定 logical_row_id，直接跳过该参数，
-   不得猜测来源。
-7. value、unit、value_type、test_conditions 仍然必须
-   来自该逻辑行，不得跨逻辑行拼接。
+6. 无法确定 logical_row_id 时跳过，不得猜测。
+7. value、unit、value_type、test_conditions 必须来自
+   当前逻辑行，不得跨行拼接。
+
+二、逐行完整性
+1. 必须按 rows 顺序逐条检查每个 logical_row_id，
+   完成全部逻辑行后才能结束；不得只提取开头或常见参数。
+2. 每条逻辑行都检查 min、typ、max 三列；某列有有效
+   数值就必须输出一条记录。空白、缺失、"—" 或不可
+   解析的列跳过；禁止输出 null、空字符串、占位符或
+   推测值。
+3. 同一逻辑行有多个有效值类型时分别输出 min/typ/max，
+   不得合并或只保留一个。
+4. 不得因参数名不在示例列表，或与其他行共享
+   primary row_index 而跳过该行。
+5. 不得把相邻行数值拼接到当前行。
+
+三、参数身份
+name 使用规范参数名，不要用符号、表头或身份描述替代：
+- output_voltage_accuracy
+- line_regulation
+- load_regulation
+- ground_current
+- ground_current_vs_load_current
+- shutdown_current
+- output_current_limit
+- short_circuit_current_limit
+- output_voltage_noise
+- dropout_voltage
+- psrr
+- uvlo_threshold
+- uvlo_hysteresis
+
+必须区分并覆盖以下参数族（输入存在有效值时）：
+1. Ground Current：静态/无负载地电流，name 为
+   ground_current。
+2. Ground Current vs Load Current：地电流随负载电流
+   变化的比例，name 为 ground_current_vs_load_current。
+3. Ground Current in Dropout：dropout 条件下的地电流，
+   必须单独成行，name 仍为 ground_current，并在
+   test_conditions 中保留体现 dropout 的 VIN/IOUT 条件；
+   不得与静态地电流合并。
+4. Output Current Limit（ICL）：
+   output_current_limit。
+5. Short-circuit Current Limit（ISC）：
+   short_circuit_current_limit；不得与 ICL 混用。
+6. 其他必须覆盖：Line Regulation、Load Regulation、
+   Shutdown Current、Output Voltage Noise。
+7. UVLO 必须区分 uvlo_threshold 与 uvlo_hysteresis；
+   VIN rising、VIN falling、VIN hysteresis 是不同行级
+   条件，必须分别输出；同一 UVLO 参数的 min/typ/max
+   也要分别输出，不得合并。
+
+四、字段输出
+1. value 只写所选 min/typ/max 列的数值，不带单位。
+2. value_type 只能是 min、typ、max，且与所选列一致。
+3. unit 复制该逻辑行 unit，不得换算或改写。
+4. test_conditions 直接复制该逻辑行 test_conditions
+   的完整原文，保留全部行级条件、温度条件和分隔符；
+   不得省略明确的 TJ/温度条件，不得用表级默认条件
+   替代行级条件。
+5. test_conditions 中不得写入参数名称、参数符号、
+   value_type、表头或“Ground current vs load current”
+   等身份描述，只保留电气/温度/频率等测试条件。
+6. 每条参数必须携带正确的 logical_row_id、primary
+   row_index、table_id、page、source_row_indices 和
+   source_text。
+7. 无法确定数值或来源时跳过该条，不得猜测。
+
+以上规则适用于一般 LDO Datasheet；不要假设任何
+特定型号的参数值、阈值或测试条件。
 """
 
 
