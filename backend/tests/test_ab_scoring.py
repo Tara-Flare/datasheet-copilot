@@ -47,7 +47,10 @@ def prediction(
 ):
     evidence = {
         "table_id": item["table_id"],
-        "row_index": item["primary_row_index"],
+        "row_index": item.get(
+            "primary_row_index",
+            (item.get("source_row_indices") or [0])[0],
+        ),
         "page": item["page"],
         "source_text": "",
     }
@@ -320,3 +323,32 @@ def test_duplicate_prediction_is_false_positive(gold):
     assert result["predicted_count"] == 2
     assert result["precision"] == 0.5
     assert result["duplicate_count"] == 1
+
+
+def test_output_voltage_noise_identity_is_strict(gold):
+    item = gold_item(gold, "t9.p33", "typ")
+    extraction = {
+        "parameters": [
+            prediction(
+                item,
+                name="output_voltage_noise",
+            )
+        ]
+    }
+
+    result = score_extraction(gold, extraction)
+
+    assert result["scorer_version"] == "b3.4c-v1"
+    assert result["matched_keys"] == 1
+    assert result["strict_matched"] == 1
+    assert result["field_accuracy"]["identity"] == 1.0
+
+    detail = next(
+        item
+        for item in result["gold_details"]
+        if item["logical_row_id"] == "t9.p33"
+        and item["value_type"] == "typ"
+    )
+
+    assert detail["fields"]["identity"] is True
+    assert detail["strict_match"] is True

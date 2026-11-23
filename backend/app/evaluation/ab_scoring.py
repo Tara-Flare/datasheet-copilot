@@ -6,6 +6,11 @@
 - 严格匹配要求身份、数值、单位、行级测试条件都正确；
 - 表级默认条件和脚注不要求 LLM 逐字输出，单独记录为 Gold 补充；
 - 无法可靠映射的预测明确标记为 unmatched，不做猜测。
+
+B3.4c：在评估层增加参数族语义优先级。
+生产 Validator / 来源映射保持不变；这里只修正评分器的
+identity 归一化，避免 "Output voltage noise" 先被
+"output voltage" 规则吞掉。
 """
 
 from collections import defaultdict
@@ -16,6 +21,9 @@ from app.validation.recovered_evidence import (
     original_family,
 )
 
+
+SCORER_VERSION = "b3.4c-v1"
+FAMILY_NORMALIZATION_VERSION = "b3.4c-family-v1"
 
 GROUND_CURRENT_IDS = {
     "t9.p8",
@@ -43,6 +51,16 @@ FAMILY_ALIASES = {
     "ground_current_in_dropout": "ground_current_dropout",
     "output_voltage_noise": "output_noise",
     "load_regulation_2": "load_regulation",
+}
+
+# 仅用于评估 identity 的语义符号；
+# 不修改生产 Validator 的 family 规则。
+NOISE_SYMBOLS = {
+    "vn",
+    "v_n",
+    "vnoise",
+    "v_noise",
+    "enoise",
 }
 
 
@@ -111,20 +129,66 @@ def normalize_family(value):
     return FAMILY_ALIASES.get(normalized, normalized)
 
 
+def _semantic_family(symbol, name):
+    """评估层语义优先规则。
+
+    优先级：noise > accuracy > 原有 family 规则。
+
+    这样可以避免 "Output voltage noise" 被
+    "output voltage" 前缀规则归为 output_voltage；
+    同时不改变生产 Validator 的 logical_family()。
+    """
+
+    symbol_text = normalize_family(symbol)
+    name_text = normalize_family(name)
+    combined = f"{symbol_text} {name_text}".strip()
+
+    has_noise = (
+        symbol_text in NOISE_SYMBOLS
+        or name_text in NOISE_SYMBOLS
+        or (
+            "noise" in combined
+            and "rejection" not in combined
+        )
+    )
+
+    if has_noise:
+        if (
+            "input" in combined
+            or symbol_text.startswith("vin")
+        ):
+            return "input_noise"
+
+        return "output_noise"
+
+    if "accuracy" in combined:
+        return "accuracy"
+
+    return None
+
+
 def gold_family(record):
+    symbol = record.get("parameter_symbol")
+    name = record.get("parameter_name")
+    semantic = _semantic_family(symbol, name)
+
+    if semantic is not None:
+        return semantic
+
     return normalize_family(
         logical_family({
-            "parameter_symbol": record.get(
-                "parameter_symbol"
-            ),
-            "parameter_name": record.get(
-                "parameter_name"
-            ),
+            "parameter_symbol": symbol,
+            "parameter_name": name,
         })
     )
 
 
 def prediction_family(name):
+    semantic = _semantic_family(None, name)
+
+    if semantic is not None:
+        return semantic
+
     return normalize_family(original_family(name))
 
 
@@ -623,6 +687,10 @@ def score_extraction(
             })
 
     return {
+        "scorer_version": SCORER_VERSION,
+        "family_normalization_version": (
+            FAMILY_NORMALIZATION_VERSION
+        ),
         "gold_count": gold_count,
         "predicted_count": predicted_count,
         "matched_keys": matched_keys,
