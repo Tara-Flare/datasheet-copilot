@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 
 SCHEMA = "recovered_evidence_validation/v1"
 VERSION = 1
+FAMILY_NORMALIZATION_VERSION = "b3.4d-validator-v1"
 
 # 原始参数名 -> 参数族
 ORIGINAL_FAMILY = {
@@ -28,6 +29,40 @@ ORIGINAL_FAMILY = {
     "uvlo_threshold": "uvlo_threshold",
     "uvlo hysteresis": "uvlo_hysteresis",
     "uvlo_hysteresis": "uvlo_hysteresis",
+}
+
+# 规范化后的参数族别名。
+# 只统一身份名称，不改变数值、单位、条件或来源校验。
+FAMILY_ALIASES = {
+    "nominal_accuracy": "accuracy",
+    "accuracy_over_temperature": "accuracy",
+    "output_voltage_accuracy": "accuracy",
+    "output_voltage_noise": "output_noise",
+    "output_noise": "output_noise",
+    "noise_voltage": "output_noise",
+    "vn": "output_noise",
+    "v_n": "output_noise",
+    "vnoise": "output_noise",
+    "v_noise": "output_noise",
+    "enoise": "output_noise",
+    "input_voltage_noise": "input_noise",
+    "input_noise": "input_noise",
+    "ground_current_vs_load_current": "ground_current_load",
+    "ground_current_in_dropout": "ground_current",
+    "output_current_limit": "current_limit",
+    "dropout_voltage": "dropout",
+    "operating_temperature": "temperature",
+    "junction_temperature": "temperature",
+    "power_supply_rejection_ratio": "psrr",
+}
+
+# 仅用于身份判断的噪声符号。
+NOISE_SYMBOLS = {
+    "VN",
+    "V_N",
+    "VNOISE",
+    "V_NOISE",
+    "ENOISE",
 }
 
 
@@ -453,14 +488,88 @@ def condition_supported(original, logical):
     )["status"] == "match"
 
 
+def _family_key(value):
+    """把参数名/符号归一化为可比较的 family key。"""
+
+    text = str(value or "").strip().lower()
+
+    while "(" in text and ")" in text:
+        start = text.find("(")
+        end = text.find(")", start)
+
+        if end == -1:
+            break
+
+        text = text[:start] + text[end + 1:]
+
+    normalized = "".join(
+        char if char.isalnum() else "_"
+        for char in text
+    )
+    normalized = "_".join(
+        part for part in normalized.split("_") if part
+    )
+
+    return normalized
+
+
+def _canonical_family(value):
+    key = _family_key(value)
+    return FAMILY_ALIASES.get(key, key)
+
+
+def _semantic_family(symbol, name):
+    """身份语义优先级：noise > accuracy > 普通 family 规则。"""
+
+    symbol_text = str(symbol or "").strip().upper()
+    name_text = str(name or "").lower()
+    combined = f"{symbol_text} {name_text}"
+
+    has_noise = (
+        symbol_text in NOISE_SYMBOLS
+        or (
+            "noise" in name_text
+            and "rejection" not in name_text
+        )
+    )
+
+    if has_noise:
+        if (
+            "input" in combined.lower()
+            or symbol_text.startswith("VIN")
+        ):
+            return "input_noise"
+
+        return "output_noise"
+
+    if "accuracy" in name_text:
+        return "accuracy"
+
+    return None
+
+
 def original_family(name):
-    key = str(name or "").strip().lower()
-    return ORIGINAL_FAMILY.get(key, key)
+    raw_key = str(name or "").strip().lower()
+
+    if raw_key in ORIGINAL_FAMILY:
+        return ORIGINAL_FAMILY[raw_key]
+
+    key = _family_key(name)
+
+    if key in ORIGINAL_FAMILY:
+        return ORIGINAL_FAMILY[key]
+
+    return FAMILY_ALIASES.get(key, key)
 
 
 def logical_family(row):
     symbol = str(row.get("parameter_symbol") or "").upper()
     name = str(row.get("parameter_name") or "").lower()
+
+    semantic = _semantic_family(symbol, name)
+
+    if semantic is not None:
+        return semantic
 
     if "HYST" in symbol or "hysteresis" in name:
         return "uvlo_hysteresis"
@@ -498,7 +607,7 @@ def logical_family(row):
     if "accuracy" in name:
         return "accuracy"
 
-    return name or symbol or "unknown"
+    return _canonical_family(name or symbol or "unknown")
 
 
 def _value_match(param, row):
@@ -1200,6 +1309,9 @@ class RecoveredEvidenceValidator:
         return {
             "schema": SCHEMA,
             "recovered_validation_version": VERSION,
+            "family_normalization_version": (
+                FAMILY_NORMALIZATION_VERSION
+            ),
             "summary": {
                 "total": total,
                 "covered": len(covered),
