@@ -9,7 +9,9 @@ from pydantic import ValidationError
 
 from app.schemas.parameter import ExtractionResult
 from app.extraction.prompts import (
+    FLAT_FAMILY_COVERAGE,
     LOGICAL_INPUT_INSTRUCTION,
+    LOGICAL_INPUT_INSTRUCTION_BASE,
     LOGICAL_RETRY_INSTRUCTION,
     SYSTEM_PROMPT,
 )
@@ -90,6 +92,7 @@ class DeepSeekExtractor:
         raw_structure=None,
         logical_table_ids=None,
         include_needs_review=False,
+        family_coverage=None,
     ):
         api_key = os.getenv("LLM_API_KEY")
         base_url = os.getenv(
@@ -119,6 +122,27 @@ class DeepSeekExtractor:
         self.include_needs_review = bool(
             include_needs_review
         )
+
+        # B3.6 A/B：低频参数族 Prompt 覆盖开关。
+        # 默认关闭，保证 B3.5c 基线可复现；
+        # B3.6 各实验臂通过 PROMPT_FAMILY_COVERAGE=1 开启。
+        if family_coverage is None:
+            family_coverage = os.getenv(
+                "PROMPT_FAMILY_COVERAGE", "0"
+            ).strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+
+        self.family_coverage = bool(family_coverage)
+
+        # MVP 生产默认固定 temperature=0.0；
+        # 仍可通过 LLM_TEMPERATURE 显式覆盖。
+        try:
+            self.temperature = float(
+                os.getenv("LLM_TEMPERATURE", "0.0")
+            )
+        except (TypeError, ValueError):
+            self.temperature = 0.0
 
         # 单次响应的输出 Token 上限。
         # 可通过 LLM_MAX_TOKENS 环境变量覆盖。
@@ -230,6 +254,9 @@ parameters 中的每个参数必须符合以下规则：
                     "type": "json_object"
                 },
                 max_tokens=self.max_tokens,
+                temperature=getattr(
+                    self, "temperature", 0.0
+                ),
             )
 
             usage = response.usage
@@ -510,9 +537,18 @@ parameters 中的每个参数必须符合以下规则：
         )
 
         instruction = EXTRACT_INSTRUCTION
+        family_coverage = getattr(
+            self, "family_coverage", False
+        )
 
         if logical:
-            instruction += LOGICAL_INPUT_INSTRUCTION
+            instruction += (
+                LOGICAL_INPUT_INSTRUCTION
+                if family_coverage
+                else LOGICAL_INPUT_INSTRUCTION_BASE
+            )
+        elif family_coverage:
+            instruction += FLAT_FAMILY_COVERAGE
 
         try:
             return self._request_json(

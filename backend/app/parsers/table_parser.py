@@ -40,16 +40,112 @@ def _runtime_device_label(pipeline_options):
     return getattr(device, "value", None) or str(device)
 
 
+def _apply_flat_glyph_restoration(
+    tables,
+    raw_tables,
+    pdf_path,
+):
+    """把 PDF 字形证据应用到 Flat 表格。
+
+    只在 Docling 文本与 PDF 文本仅相差已登记字形时
+    修改单元格；原始 Docling 文本写入 docling_cells，
+    供审计。没有字形证据时不改动任何表。
+    """
+
+    page_numbers = sorted({
+        cell.get("page_no")
+        for raw_table in raw_tables
+        for cell in raw_table.get("cells", [])
+        if isinstance(cell.get("page_no"), int)
+    })
+
+    if not page_numbers:
+        return
+
+    import pymupdf as fitz
+
+    from app.parsers.structure_recovery import (
+        extract_page_words,
+        restore_flat_table_glyphs,
+    )
+
+    try:
+        document = fitz.open(str(pdf_path))
+    except Exception:  # pragma: no cover - 防御性分支
+        return
+
+    try:
+        words_by_page = {}
+        page_heights = {}
+
+        for page_no in page_numbers:
+            if not 1 <= page_no <= document.page_count:
+                continue
+
+            try:
+                page = document[page_no - 1]
+                words_by_page[page_no] = extract_page_words(page)
+                page_heights[page_no] = float(page.rect.height)
+            except Exception:  # pragma: no cover - 防御性分支
+                continue
+    finally:
+        document.close()
+
+    raw_by_id = {
+        raw_table.get("table_id"): raw_table
+        for raw_table in raw_tables
+    }
+
+    for table in tables:
+        raw_table = raw_by_id.get(table.get("table_id"))
+
+        if raw_table is None:
+            continue
+
+        restored, evidence = restore_flat_table_glyphs(
+            table,
+            raw_table,
+            words_by_page=words_by_page,
+            page_heights=page_heights,
+        )
+
+        if not evidence:
+            continue
+
+        table["rows"] = restored["rows"]
+        table["docling_cells"] = [
+            {
+                "cell_id": entry["cell_id"],
+                "row_index": updated["row_index"],
+                "column_index": updated["column_index"],
+                "docling_text": entry["docling_text"],
+                "pdf_text": entry["pdf_text"],
+            }
+            for entry in evidence
+            for updated in entry["updated_cells"]
+        ]
+        table["glyph_evidence"] = evidence
+
+
 class TableParser:
     """Datasheet 表格结构化解析器。"""
 
-    def __init__(self):
+    def __init__(self, artifacts_path=None):
         # 第一版只处理具有文本层的 PDF。
         # 扫描版 OCR 在后续模块中启用。
         pipeline_options = PdfPipelineOptions(
             do_ocr=False,
             do_table_structure=True,
         )
+
+        # 离线部署可指向仓库内模型目录；未设置时保持
+        # Docling 原有行为（内部自行解析/下载）。
+        artifacts = artifacts_path or os.getenv(
+            "DOCLING_ARTIFACTS_PATH"
+        )
+
+        if artifacts:
+            pipeline_options.artifacts_path = str(artifacts)
 
         # 保留配置，供缓存失效判定使用
         self.pipeline_options = pipeline_options
@@ -147,15 +243,20 @@ class TableParser:
             # 在 TableItem 仍然可用时（DataFrame 扁平化不破坏
             # table.data）记录原始单元格结构；
             # 该分支不影响上面的既有字段。
-            if include_raw_structure:
-                raw_tables.append(
-                    table_to_raw_structure(
-                        table,
-                        index,
-                        columns=columns,
-                        flattened_row_count=len(df),
-                    )
+            # B3.8：即使不导出 raw_structure，也保留一份临时
+            # 原始结构用于 Flat 单元格式字形恢复。
+            raw_tables.append(
+                table_to_raw_structure(
+                    table,
+                    index,
+                    columns=columns,
+                    flattened_row_count=len(df),
                 )
+            )
+
+        _apply_flat_glyph_restoration(
+            tables, raw_tables, path
+        )
 
         output = {
             "filename": path.name,

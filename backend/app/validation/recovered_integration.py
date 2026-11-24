@@ -246,6 +246,8 @@ def _unavailable_result(extraction, errors):
         merged["validation_source"] = "recovered"
         merged["detailed_recovery_status"] = "unavailable"
         merged["recovered_logical_row_id"] = None
+        merged["identity_ambiguous"] = False
+        merged["recovered_reason"] = None
         merged["missing_fields"] = []
         merged["conflicting_fields"] = []
         merged["missing_conditions"] = []
@@ -309,6 +311,8 @@ def _merge_results(extraction, legacy_result, recovered_report):
             merged["validation_source"] = "legacy"
             merged["detailed_recovery_status"] = "not_covered"
             merged["recovered_logical_row_id"] = None
+            merged["identity_ambiguous"] = False
+            merged["recovered_reason"] = None
             merged["missing_fields"] = []
             merged["conflicting_fields"] = []
             merged["missing_conditions"] = []
@@ -326,6 +330,10 @@ def _merge_results(extraction, legacy_result, recovered_report):
             merged["recovered_logical_row_id"] = recovered.get(
                 "selected_logical_row_id"
             )
+            merged["identity_ambiguous"] = bool(
+                recovered.get("identity_ambiguous")
+            )
+            merged["recovered_reason"] = recovered.get("reason")
             merged["missing_fields"] = recovered.get(
                 "missing_fields", []
             )

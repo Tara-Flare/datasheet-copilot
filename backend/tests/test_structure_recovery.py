@@ -16,6 +16,8 @@ from app.parsers.structure_recovery import (
 )
 
 
+pytestmark = pytest.mark.requires_data
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RAW_PATH = (
     PROJECT_ROOT
@@ -23,6 +25,12 @@ RAW_PATH = (
 )
 PDF_PATH = PROJECT_ROOT / "data/samples/TPS7A02.pdf"
 CACHE_DIR = PROJECT_ROOT / "data/cache/docling"
+
+if not RAW_PATH.is_file():
+    pytest.skip(
+        "缺少本地 data/ fixtures；见 docs/DATA_LAYOUT.md",
+        allow_module_level=True,
+    )
 
 # 在模块导入时（任何恢复调用之前）记录原始文件哈希
 RAW_SHA_AT_IMPORT = hashlib.sha256(

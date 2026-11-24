@@ -11,6 +11,9 @@ from decimal import Decimal, InvalidOperation
 SCHEMA = "recovered_evidence_validation/v1"
 VERSION = 1
 FAMILY_NORMALIZATION_VERSION = "b3.4d-validator-v1"
+# B3.8：只扩充身份同义词与歧义识别；数值/单位/条件/来源
+# 校验规则不变。单独记录版本，避免改写历史 B3.4d 版本号。
+IDENTITY_SYNONYM_VERSION = "b3.9-identity-v1"
 
 # 原始参数名 -> 参数族
 ORIGINAL_FAMILY = {
@@ -54,6 +57,61 @@ FAMILY_ALIASES = {
     "operating_temperature": "temperature",
     "junction_temperature": "temperature",
     "power_supply_rejection_ratio": "psrr",
+
+    # B3.8：四份 PDF 中真实出现的同义身份。
+    # 只合并“同一参数的不同叫法”，不合并
+    # internal / programmable current limit 等
+    # 语义不同的具体身份。
+    "quiescent_current": "ground_current",
+    "quiescent_current_in_shutdown": "shutdown_current",
+    "standby_current": "shutdown_current",
+    "ground_pin_current": "ground_current",
+    "ground_pin_current_in_shutdown": "shutdown_current",
+    "maximum_output_current": "output_current",
+    "operating_input_voltage": "input_voltage",
+    "short_current_limit": "short_circuit_current_limit",
+    "short_circuit_current": "short_circuit_current_limit",
+    "output_short_circuit_current": (
+        "short_circuit_current_limit"
+    ),
+    "output_short_circuit_current_limit": (
+        "short_circuit_current_limit"
+    ),
+    "rms_output_noise": "output_noise",
+    "rms_output_voltage_noise": "output_noise",
+    "output_noise_voltage": "output_noise",
+    "ven_high_voltage": "enable_high_voltage",
+    "ven_low_voltage": "enable_low_voltage",
+    "en_threshold_voltage": "en_pin_threshold_voltage",
+    "enable_threshold_voltage": "en_pin_threshold_voltage",
+    "enable_pin_current": "en_pin_current",
+    "start_up_time": "startup_time",
+    "en_pull_down_resistor": "enable_pull_down_resistance",
+    "vout_discharge_resistor": "output_discharge_resistance",
+    "input_supply_ripple_rejection": "psrr",
+    "ripple_rejection": "psrr",
+    "programming_scale_factor": (
+        "current_limit_programming_scale_factor"
+    ),
+    "current_limit_programming_scale_factor": (
+        "current_limit_programming_scale_factor"
+    ),
+    "output_current_limit_programming_scale_factor": (
+        "current_limit_programming_scale_factor"
+    ),
+    "iq": "ground_current",
+    "istb": "shutdown_current",
+    "istd": "shutdown_current",
+}
+
+# B3.8：泛化身份 -> 可对应的多个具体身份。
+# 命中时保留 conflict，并在诊断中标记“同名歧义”，
+# 不允许自动继承具体身份。
+AMBIGUOUS_GENERIC_FAMILIES = {
+    "current_limit": {
+        "internal_current_limit",
+        "programmable_current_limit",
+    },
 }
 
 # 仅用于身份判断的噪声符号。
@@ -571,8 +629,26 @@ def logical_family(row):
     if semantic is not None:
         return semantic
 
+    # B3.8：编程比例因子行的 parameter_name 可能被填成
+    # 容器标题（Programmable Current Limit），必须以更
+    # 具体的 parameter_symbol 为准。
+    if "scale factor" in name or "scale factor" in symbol.lower():
+        return "current_limit_programming_scale_factor"
+
     if "HYST" in symbol or "hysteresis" in name:
-        return "uvlo_hysteresis"
+        # B3.9：hysteresis 不是 UVLO 专属；必须保留
+        # Thermal Shutdown / PGFB 等独立身份，否则会误拒
+        # 合法参数。
+        if "uvlo" in symbol.lower() or "uvlo" in name:
+            return "uvlo_hysteresis"
+
+        if "thermal" in name:
+            return "thermal_shutdown_hysteresis"
+
+        if "pgfb" in name:
+            return "pgfb_hysteresis"
+
+        return _canonical_family(name or symbol)
 
     if "VUVLO" in symbol or "uvlo" in name:
         return "uvlo_threshold"
@@ -736,11 +812,19 @@ def _unit_match(param, row):
 def _identity_match(param, row):
     original = original_family(param.get("name"))
     logical = logical_family(row)
+    ambiguous_candidates = sorted(
+        AMBIGUOUS_GENERIC_FAMILIES.get(original, set())
+    )
 
     return {
         "status": "match" if original == logical else "conflict",
         "original_family": original,
         "logical_family": logical,
+        "ambiguous": (
+            original != logical
+            and logical in ambiguous_candidates
+        ),
+        "ambiguous_candidates": ambiguous_candidates,
         "logical_symbol": row.get("parameter_symbol"),
         "logical_name": row.get("parameter_name"),
     }
@@ -965,6 +1049,7 @@ class RecoveredEvidenceValidator:
             "conflicts": [],
             "correction_suggestions": [],
             "recovered_status": None,
+            "identity_ambiguous": False,
             "reason": None,
         }
 
@@ -1112,12 +1197,28 @@ class RecoveredEvidenceValidator:
                 "fields_to_fix": conflicts + missing_fields,
             })
 
+        result["identity_ambiguous"] = bool(
+            identity.get("ambiguous")
+        )
+
         if conflicts:
             result["recovered_status"] = "invalid"
 
             if "test_conditions" in conflicts:
                 result["reason"] = (
                     "测试条件与逻辑行存在明确冲突"
+                )
+            elif (
+                conflicts == ["identity"]
+                and identity.get("ambiguous")
+            ):
+                result["reason"] = (
+                    "同名参数歧义："
+                    f"{identity['original_family']} 可对应 "
+                    + ", ".join(
+                        identity.get("ambiguous_candidates", [])
+                    )
+                    + "；不得自动继承具体身份"
                 )
             else:
                 result["reason"] = (
@@ -1311,6 +1412,9 @@ class RecoveredEvidenceValidator:
             "recovered_validation_version": VERSION,
             "family_normalization_version": (
                 FAMILY_NORMALIZATION_VERSION
+            ),
+            "identity_synonym_version": (
+                IDENTITY_SYNONYM_VERSION
             ),
             "summary": {
                 "total": total,

@@ -1,5 +1,6 @@
 
 from copy import deepcopy
+from collections import Counter
 from decimal import Decimal, InvalidOperation
 import re
 
@@ -12,11 +13,18 @@ VALUE_COLUMNS = {
 
 
 def normalize_header(value: str) -> str:
-    """标准化表头名称。"""
+    """标准化表头名称。
+
+    去掉脚注括号，例如 "MIN (Note 9)" 归一化为 "min"，
+    否则无法匹配 MIN/TYP/MAX 列。
+    """
+    text = str(value).lower()
+    text = re.sub(r"\([^)]*\)", " ", text)
+
     return re.sub(
         r"[^a-z]",
         "",
-        str(value).lower()
+        text
     )
 
 
@@ -28,6 +36,105 @@ def normalize_unit(unit: str) -> str:
         .replace("μ", "u")
         .replace("µ", "u")
     )
+
+
+def canonical_unit_cell(unit: str) -> str:
+    """合并单元格中的重复单位。
+
+    Docling 的扁平表格会把同一参数块的多个子行
+    合并成一个单位单元格，如 "µA µA µA"。只有所有
+    单位 token 完全一致时才折叠为单一单位；不一致
+    时保留原文，交给校验器判为待复核。
+    """
+
+    text = normalize_unit(unit)
+    tokens = text.split()
+
+    if tokens and len(set(tokens)) == 1:
+        return tokens[0]
+
+    return text
+
+
+_PLACEHOLDER_CELL = re.compile(
+    r"^(?:l|i|image|<!--\s*image\s*-->)+$",
+    re.IGNORECASE,
+)
+_QUOTE_TOKEN_RE = re.compile(
+    r"[a-z0-9.]+|<=|>=|<|>|=|%|\+|-"
+)
+
+
+def _quote_tokens(value: str) -> list[str]:
+    text = normalize_text(value).lower()
+    text = (
+        text.replace("–", "-")
+        .replace("−", "-")
+        .replace("‒", "-")
+    )
+
+    return _QUOTE_TOKEN_RE.findall(text)
+
+
+def _significant_row_cells(row) -> list[str]:
+    """过滤 Docling 占位符与图片标记，保留真实单元格文本。"""
+
+    cells = []
+
+    for cell in row:
+        if cell is None:
+            continue
+
+        text = re.sub(
+            r"<!--\s*image\s*-->",
+            " ",
+            str(cell),
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if not text:
+            continue
+
+        compact = re.sub(r"\s+", "", text)
+
+        if _PLACEHOLDER_CELL.fullmatch(compact):
+            continue
+
+        cells.append(text)
+
+    return cells
+
+
+def _quote_matches_row(quote: str, row) -> bool:
+    """引用与来源行的 token 互相包含即视为一致。
+
+    保留原有“引用可以是行文本子集”的语义；同时允许
+    模型在合并行引用中附带 TYP/MAX 等列标签（引用是
+    行文本的超集）。两种情况都要求 token 完全对应，
+    不接受只命中部分内容的引用。
+    """
+
+    if not quote:
+        return False
+
+    row_tokens = Counter(
+        _quote_tokens(" ".join(_significant_row_cells(row)))
+    )
+    quote_tokens = Counter(_quote_tokens(quote))
+
+    if not row_tokens or not quote_tokens:
+        return False
+
+    quote_inside_row = all(
+        count <= row_tokens[token]
+        for token, count in quote_tokens.items()
+    )
+    row_inside_quote = all(
+        count <= quote_tokens[token]
+        for token, count in row_tokens.items()
+    )
+
+    return quote_inside_row or row_inside_quote
 
 
 def normalize_text(value: str) -> str:
@@ -91,6 +198,112 @@ def find_column(columns, aliases):
     return None
 
 
+def _merged_unit_fallback(
+    row_index,
+    rows,
+    unit_column,
+    extracted_unit,
+):
+    """合并单位单元格的兜底解析。
+
+    有些表格只在同一参数块的首行填单位，后续行的
+    UNIT 单元格为空。只在同一参数名/符号的相邻行
+    中找到相同单位时才接受，避免跨参数猜测。
+    """
+
+    if not extracted_unit:
+        return ""
+
+    row = rows[row_index]
+
+    def cell_text(candidate, index):
+        if index >= len(candidate):
+            return ""
+        return str(candidate[index] or "").strip().lower()
+
+    symbol = cell_text(row, 0)
+    name = cell_text(row, 1)
+
+    for offset in range(1, 5):
+        for candidate_index in (
+            row_index - offset,
+            row_index + offset,
+        ):
+            if not 0 <= candidate_index < len(rows):
+                continue
+
+            candidate = rows[candidate_index]
+
+            if unit_column >= len(candidate):
+                continue
+
+            unit = canonical_unit_cell(
+                candidate[unit_column]
+            )
+
+            if unit != extracted_unit:
+                continue
+
+            if symbol and cell_text(
+                candidate, 0
+            ) != symbol:
+                continue
+
+            if name and cell_text(
+                candidate, 1
+            ) != name:
+                continue
+
+            return unit
+
+    return ""
+
+
+def _identity_qualifier_issue(param_name, row, columns):
+    """检查名称与来源行的 shutdown/standby 限定是否一致。
+
+    Flat 路径没有 Logical 身份表，但来源行的参数列本身
+    带有 "in Shutdown" / "Standby" 等语义限定。预测名
+    缺少或凭空增加该限定时，属于可证明的身份错误，
+    不能因为数值和单位相同而放行。
+    """
+
+    parameter_cells = []
+
+    for index, column in enumerate(columns):
+        normalized = normalize_header(column)
+
+        if "parameter" not in normalized and "symbol" not in normalized:
+            continue
+
+        if index < len(row) and row[index]:
+            parameter_cells.append(str(row[index]))
+
+    if not parameter_cells:
+        return None
+
+    source_text = " ".join(parameter_cells).lower()
+    prediction = re.sub(
+        r"[^a-z]+", "", str(param_name or "").lower()
+    )
+
+    source_limited = (
+        "shutdown" in source_text or "standby" in source_text
+    )
+    prediction_limited = (
+        "shutdown" in prediction or "standby" in prediction
+    )
+
+    if source_limited == prediction_limited:
+        return None
+
+    return (
+        "参数身份与来源行限定不一致：来源行"
+        + ("包含" if source_limited else "不包含")
+        + " shutdown/standby 限定"
+    )
+
+
 def verify_single_parameter(
     param: dict,
     table_map: dict
@@ -144,6 +357,15 @@ def verify_single_parameter(
         return "invalid", ["来源页码不匹配"]
 
     row = rows[row_index]
+
+    identity_issue = _identity_qualifier_issue(
+        param.get("name"),
+        row,
+        columns,
+    )
+
+    if identity_issue:
+        issues.append(identity_issue)
 
     # 2. 参数类型检查
     value_type = param.get("value_type")
@@ -209,13 +431,22 @@ def verify_single_parameter(
             issues + ["无法识别单位列"]
         )
 
-    source_unit = normalize_unit(
-        row[unit_column]
-    )
-
     extracted_unit = normalize_unit(
         param.get("unit", "")
     )
+    source_unit = canonical_unit_cell(
+        row[unit_column]
+    )
+    if not source_unit:
+        fallback = _merged_unit_fallback(
+            row_index,
+            rows,
+            unit_column,
+            extracted_unit,
+        )
+
+        if fallback:
+            source_unit = fallback
 
     if source_unit != extracted_unit:
         issues.append(
@@ -224,20 +455,11 @@ def verify_single_parameter(
         )
 
     # 5. 来源原文检查
-    row_text = " ".join(
-        str(cell)
-        for cell in row
-        if cell is not None
-    )
-
     quote = evidence.get(
         "source_text", ""
     ).strip()
 
-    if not quote or (
-        normalize_text(quote)
-        not in normalize_text(row_text)
-    ):
+    if not _quote_matches_row(quote, row):
         issues.append("原文引用不匹配")
 
     if issues:

@@ -1,36 +1,47 @@
+"""Datasheet Copilot 真实端到端提参入口（MVP）。
+
+默认方案：
+- D：Logical + P1 + recovered 校验（生产默认）
+可配置回退：
+- C：Flat + P1 + legacy 校验
+
+生产链路会真实解析 PDF、按需运行 StructureRecovery，
+再通过 LogicalTableAdapter 装配模型输入，最后执行
+legacy + recovered 校验。不会写死参数值。
+"""
 
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
-from uuid import uuid4
 
-from app.parsers.pdf_parser import PDFParser
-from app.parsers.table_parser import TableParser
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-from app.parsers.table_selector import (
-    TableSelector,
-    SelectedTableParser,
-)
+for path in (PROJECT_ROOT / "backend",):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
 
-from app.parsers.table_cache import TableParseCache
-
-from app.extraction.deepseek_extractor import (
-    DeepSeekExtractor
-)
-
-from app.extraction.artifact_store import (
+from app.extraction.artifact_store import (  # noqa: E402
     RecordingExtractor,
     artifact_from_state,
     file_sha256,
     save_artifact,
 )
+from app.extraction.deepseek_extractor import (  # noqa: E402
+    DeepSeekExtractor,
+)
+from app.pipeline import (  # noqa: E402
+    PipelineError,
+    parse_table_ids,
+    resolve_run_profile,
+    run_pipeline,
+)
 
-from app.agents.graph import build_graph
 
-
-DEFAULT_OUTPUT_DIR = Path("data/outputs")
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "data/outputs"
+DEFAULT_DOCLING_ARTIFACTS = PROJECT_ROOT / "docling-models"
 
 
 def default_output_path(pdf_path: str) -> Path:
@@ -42,8 +53,47 @@ def default_output_path(pdf_path: str) -> Path:
     )
 
 
-def run_e2e(pdf_path: str, output_json=None):
+def configure_docling_environment():
+    """离线环境下复用仓库内 Docling 模型。"""
+
+    if (
+        not os.getenv("DOCLING_ARTIFACTS_PATH")
+        and DEFAULT_DOCLING_ARTIFACTS.is_dir()
+    ):
+        os.environ["DOCLING_ARTIFACTS_PATH"] = str(
+            DEFAULT_DOCLING_ARTIFACTS
+        )
+
+
+def _load_override(path):
+    if not path:
+        return None
+
+    return json.loads(
+        Path(path).read_text(encoding="utf-8")
+    )
+
+
+def _write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
+
+
+def run_e2e(
+    pdf_path: str,
+    output_json=None,
+    *,
+    profile=None,
+    table_ids=None,
+):
     """运行真实 Datasheet 端到端提参流程。"""
+
+    configure_docling_environment()
 
     pdf_path = str(Path(pdf_path).resolve())
 
@@ -52,323 +102,155 @@ def run_e2e(pdf_path: str, output_json=None):
             f"找不到 PDF 文件: {pdf_path}"
         )
 
+    resolved = resolve_run_profile(profile)
+
+    logical_rows_override = _load_override(
+        os.getenv("RECOVERED_EVIDENCE_LOGICAL_ROWS")
+    )
+    raw_structure_override = _load_override(
+        os.getenv("RECOVERED_EVIDENCE_RAW_STRUCTURE")
+    )
+
+    if logical_rows_override is not None and raw_structure_override is None:
+        raise PipelineError(
+            "设置 RECOVERED_EVIDENCE_LOGICAL_ROWS 时必须同时设置 "
+            "RECOVERED_EVIDENCE_RAW_STRUCTURE"
+        )
+
+    # 先完成配置校验（例如缺少 LLM_API_KEY），避免先打印运行横幅再报错。
+    extractor = DeepSeekExtractor(
+        family_coverage=resolved.family_coverage,
+    )
+    recording_extractor = RecordingExtractor(extractor)
+
     print("=" * 60)
     print("Datasheet Copilot - E2E")
     print("=" * 60)
-
     print(f"PDF 文件: {pdf_path}")
-
-    # 1. 初始化工具
-    pdf_parser = PDFParser()
-
-    raw_table_parser = TableParser()
-
-    selector = TableSelector(
-        max_tables=4,
-        max_chars=40000,
+    print(f"运行方案: {resolved.key.upper()} ({resolved.label})")
+    print(
+        "输入模式:",
+        resolved.input_mode,
+        "| Prompt:",
+        resolved.prompt_family,
+        "| 校验:",
+        resolved.evidence_validation_mode,
     )
 
-    cache = TableParseCache.from_env()
+    started = time.perf_counter()
 
-    table_parser = SelectedTableParser(
-        raw_table_parser,
-        selector,
-        cache=cache,
-    )
-
-    extractor = DeepSeekExtractor()
-
-    # 在不修改 DeepSeekExtractor 的前提下，
-    # 记录其完整原始结构化输出。
-    recording_extractor = RecordingExtractor(
-        extractor
-    )
-
-    # 证据校验模式：默认 legacy；recovered 必须显式启用。
-    evidence_validation_mode = os.getenv(
-        "EVIDENCE_VALIDATION_MODE", "legacy"
-    ).strip().lower()
-
-    recovered_evidence = None
-
-    if evidence_validation_mode == "recovered":
-        logical_rows_path = os.getenv(
-            "RECOVERED_EVIDENCE_LOGICAL_ROWS",
-            "data/outputs/TPS7A02.logical_rows.v1.json",
-        )
-        raw_structure_path = os.getenv(
-            "RECOVERED_EVIDENCE_RAW_STRUCTURE",
-            "data/outputs/TPS7A02.raw_structure.v1.json",
-        )
-
-        recovered_evidence = {
-            "logical_rows": json.loads(
-                Path(logical_rows_path).read_text(
-                    encoding="utf-8"
-                )
-            ),
-            "raw_structure": json.loads(
-                Path(raw_structure_path).read_text(
-                    encoding="utf-8"
-                )
-            ),
-            "pdf_sha256": file_sha256(pdf_path),
-            "on_error": os.getenv(
-                "RECOVERED_EVIDENCE_ON_ERROR",
-                "pending_review",
-            ),
-        }
-
-    # 提取输入模式：默认 flat；logical 必须显式启用。
-    extraction_input_mode = os.getenv(
-        "EXTRACTION_INPUT_MODE", "flat"
-    ).strip().lower()
-
-    logical_extraction = None
-
-    if extraction_input_mode == "logical":
-        if recovered_evidence is not None:
-            logical_rows = recovered_evidence[
-                "logical_rows"
-            ]
-            raw_structure = recovered_evidence[
-                "raw_structure"
-            ]
-        else:
-            logical_rows_path = os.getenv(
-                "RECOVERED_EVIDENCE_LOGICAL_ROWS",
-                "data/outputs/TPS7A02.logical_rows.v1.json",
-            )
-            raw_structure_path = os.getenv(
-                "RECOVERED_EVIDENCE_RAW_STRUCTURE",
-                "data/outputs/TPS7A02.raw_structure.v1.json",
-            )
-
-            logical_rows = json.loads(
-                Path(logical_rows_path).read_text(
-                    encoding="utf-8"
-                )
-            )
-            raw_structure = json.loads(
-                Path(raw_structure_path).read_text(
-                    encoding="utf-8"
-                )
-            )
-
-        table_ids_env = os.getenv(
-            "EXTRACTION_INPUT_TABLE_IDS", ""
-        ).strip()
-
-        logical_extraction = {
-            "logical_rows": logical_rows,
-            "raw_structure": raw_structure,
-            "table_ids": (
-                [
-                    int(value)
-                    for value in table_ids_env.split(",")
-                    if value.strip()
-                ]
-                if table_ids_env
-                else None
-            ),
-        }
-
-    # 2. 构建 LangGraph
-    graph = build_graph(
-        pdf_parser=pdf_parser,
-        table_parser=table_parser,
+    run = run_pipeline(
+        pdf_path,
+        profile=resolved,
         extractor=recording_extractor,
-        evidence_validation_mode=evidence_validation_mode,
-        recovered_evidence=recovered_evidence,
-        extraction_input_mode=extraction_input_mode,
-        logical_extraction=logical_extraction,
+        table_ids=table_ids,
+        logical_rows_override=logical_rows_override,
+        raw_structure_override=raw_structure_override,
     )
 
-    # 3. 设置独立任务 ID
-    task_id = str(uuid4())
+    duration = time.perf_counter() - started
 
-    config = {
-        "configurable": {
-            "thread_id": task_id
-        }
-    }
+    result = run["state"]
+    validation = run["validation"]
+    summary = run["summary"]
+    diagnostics = run["diagnostics"]
 
-    # 4. 初始化 Agent State
-    initial_state = {
-        "document_path": pdf_path,
-        "status": "pending",
-        "retry_count": 0,
-        "max_retries": 1,
-
-        # 首次真实测试暂不等待人工输入
-        "enable_human_review": False,
-
-        "errors": [],
-    }
-
-    print("\n开始执行 Agent...")
-    print(f"Task ID: {task_id}")
-
-    start_time = time.perf_counter()
-
-    # 5. 执行整个 Agent 工作流
-    result = graph.invoke(
-        initial_state,
-        config=config,
-    )
-
-    duration = time.perf_counter() - start_time
-
-    # 6. 保存完整提取结果（含 evidence 与来源信息）
     if output_json is None:
         output_json = default_output_path(pdf_path)
-
-    cache_key = None
-    cache_dir = None
-
-    if cache is not None:
-        cache_key = cache.build_key(
-            pdf_path,
-            table_parser._config_signature(),
-        )
-        cache_dir = Path(cache.cache_dir).resolve()
 
     artifact = artifact_from_state(
         result,
         recording_extractor,
         pdf_path=pdf_path,
         pdf_sha256=file_sha256(pdf_path),
-        table_cache_dir=cache_dir,
-        table_cache_key=cache_key,
         model=getattr(extractor, "model", None),
     )
+    saved_path = save_artifact(artifact, output_json)
 
-    saved_path = save_artifact(
-        artifact,
-        output_json,
+    sidecar = Path(saved_path).with_suffix(
+        ".pipeline.json"
+    )
+    _write_json(
+        sidecar,
+        {
+            "schema": "mvp_pipeline_run/v1",
+            "pdf_path": pdf_path,
+            "profile": resolved.to_dict(),
+            "diagnostics": diagnostics,
+            "validation_summary": summary,
+            "usage": extractor.get_usage(),
+            "elapsed_s": round(duration, 3),
+        },
     )
 
     print("\n提取结果已保存:", saved_path)
+    print("运行诊断已保存:", sidecar)
 
-    # 7. 读取结果
-    document_info = result.get(
-        "document_info", {}
-    )
-
-    validation = result.get(
-        "validation_result", {}
-    )
-
-    parameters = validation.get(
-        "parameters", []
-    )
-
-    summary = validation.get(
-        "validation_summary", {}
-    )
-
-    # 8. 打印摘要
     print("\n" + "=" * 60)
     print("执行结果")
     print("=" * 60)
-
+    print("任务状态:", result.get("status"))
+    print("运行方案:", diagnostics["profile"]["label"])
     print(
-        "任务状态:",
-        result.get("status")
+        "StructureRecovery:",
+        diagnostics["structure_recovery"],
     )
-
     print(
-        "PDF 页数:",
-        document_info.get("page_count")
+        "实际输入模式:",
+        diagnostics.get("effective_input_mode"),
     )
-
     print(
-        "候选表格数:",
-        document_info.get("table_count")
+        "校验模式:",
+        diagnostics.get("validation_mode"),
     )
+    print("提取参数数:", summary["total"])
+    print("自动接受 (validated):", summary["validated"])
+    print("待人工复核 (pending_review):", summary["pending_review"])
+    print("拒绝 (invalid):", summary["invalid"])
+    print("自动重试次数:", result.get("retry_count", 0))
+    print(f"总耗时: {duration:.2f} 秒")
 
-    print(
-        "提取参数数:",
-        len(parameters)
-    )
-
-    print(
-        "验证通过:",
-        summary.get("validated", 0)
-    )
-
-    print(
-        "验证失败:",
-        summary.get("invalid", 0)
-    )
-
-    print(
-        "待人工复核:",
-        summary.get("pending_review", 0)
-    )
-
-    print(
-        "自动重试次数:",
-        result.get("retry_count", 0)
-    )
-
-    print(
-        f"总耗时: {duration:.2f} 秒"
-    )
-
-    # 9. 输出各参数
-    print("\n参数提取明细：")
-
-    for index, param in enumerate(
-        parameters,
-        start=1
-    ):
-        print("-" * 50)
-
-        print(f"[{index}] {param['name']}")
-
+    print("\n自动接受参数：")
+    for param in summary["auto_accepted_parameters"]:
+        evidence = param.get("evidence") or {}
         print(
-            "数值:",
-            param["value"],
-            param["unit"]
+            f"- {param.get('name')}: "
+            f"{param.get('value')} {param.get('unit')} "
+            f"({param.get('value_type')}) "
+            f"table={evidence.get('table_id')} "
+            f"row={evidence.get('row_index')}"
         )
 
-        print(
-            "类型:",
-            param["value_type"]
-        )
+    if summary["pending_parameters"]:
+        print("\n待人工复核参数：")
+        for param in summary["pending_parameters"]:
+            print(
+                f"- {param.get('name')}: "
+                f"{param.get('value')} {param.get('unit')} "
+                f"errors={param.get('validation_errors', [])}"
+            )
 
-        print(
-            "测试条件:",
-            param.get("test_conditions")
-        )
+    if summary["invalid_parameters"]:
+        print("\n被拒绝参数：")
+        for param in summary["invalid_parameters"]:
+            print(
+                f"- {param.get('name')}: "
+                f"{param.get('value')} {param.get('unit')} "
+                f"errors={param.get('validation_errors', [])}"
+            )
 
-        print(
-            "校验状态:",
-            param.get("validation_status")
-        )
-
-        print(
-            "错误信息:",
-            param.get("validation_errors", [])
-        )
-
-        print(
-            "来源:",
-            param.get("evidence")
-        )
-
-    # 10. 模型用量
     print("\nLLM Token 使用情况：")
-
-    usage = extractor.get_usage()
-
-    for key, value in usage.items():
+    for key, value in extractor.get_usage().items():
         print(f"{key}: {value}")
 
     print("\nAgent 执行结束。")
 
-    return result
+    return {
+        "result": result,
+        "run": run,
+        "artifact_path": str(saved_path),
+        "sidecar_path": str(sidecar),
+    }
 
 
 def main():
@@ -378,9 +260,8 @@ def main():
 
     parser.add_argument(
         "pdf",
-        help="Datasheet PDF 文件路径"
+        help="Datasheet PDF 文件路径",
     )
-
     parser.add_argument(
         "--output-json",
         default=None,
@@ -389,13 +270,32 @@ def main():
             "（默认 data/outputs/<stem>.extraction.json）"
         ),
     )
+    parser.add_argument(
+        "--profile",
+        choices=("d", "c"),
+        default=None,
+        help=(
+            "运行方案；默认读取 DATASHEET_RUN_PROFILE，"
+            "未设置时使用 d（Logical + P1）"
+        ),
+    )
+    parser.add_argument(
+        "--table-ids",
+        default=None,
+        help="逗号分隔的目标 table_id；默认由表格选择器决定",
+    )
 
     args = parser.parse_args()
 
-    run_e2e(
-        args.pdf,
-        output_json=args.output_json,
-    )
+    try:
+        run_e2e(
+            args.pdf,
+            output_json=args.output_json,
+            profile=args.profile,
+            table_ids=parse_table_ids(args.table_ids),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

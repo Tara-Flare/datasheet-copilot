@@ -13,6 +13,8 @@ from app.validation.recovered_evidence import (
 )
 
 
+pytestmark = pytest.mark.requires_data
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXTRACTION_PATH = (
     PROJECT_ROOT
@@ -34,6 +36,12 @@ REPORT_PATH = (
     PROJECT_ROOT
     / "data/outputs/TPS7A02.recovered_validation.v1.json"
 )
+
+if not BASELINE_PATH.is_file():
+    pytest.skip(
+        "缺少本地 data/ fixtures；见 docs/DATA_LAYOUT.md",
+        allow_module_level=True,
+    )
 
 BASELINE_SHA_AT_IMPORT = hashlib.sha256(
     BASELINE_PATH.read_bytes()

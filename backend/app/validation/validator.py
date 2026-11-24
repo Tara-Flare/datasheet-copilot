@@ -28,28 +28,38 @@ class ParameterValidator:
         for index, param in enumerate(parameters):
 
             # 保留前面来源校验产生的错误
-            errors = list(
+            evidence_errors = list(
                 param.get("validation_errors", [])
             )
 
-            errors.extend(
+            # 结构性/数值性错误是硬错误；
+            # 证据不足（如多值歧义）只是 pending_review，
+            # 不能被压缩成 invalid。
+            hard_errors = list(
                 check_numeric_value(param)
             )
-
-            errors.extend(
+            hard_errors.extend(
                 relation_errors.get(index, [])
             )
 
             # 错误信息去重
-            errors = list(dict.fromkeys(errors))
+            errors = list(dict.fromkeys(
+                evidence_errors + hard_errors
+            ))
 
             previous_status = param.get(
                 "validation_status",
                 "pending_review"
             )
 
-            if errors or previous_status == "invalid":
+            if previous_status == "invalid":
                 status = "invalid"
+
+            elif hard_errors:
+                status = "invalid"
+
+            elif previous_status == "pending_review":
+                status = "pending_review"
 
             elif previous_status == "validated":
                 status = "validated"

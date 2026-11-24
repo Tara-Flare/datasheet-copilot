@@ -10,6 +10,8 @@ from app.evaluation.ab_scoring import (
 )
 
 
+pytestmark = pytest.mark.requires_data
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GOLD_PATH = (
     PROJECT_ROOT

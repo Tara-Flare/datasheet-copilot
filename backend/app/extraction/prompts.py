@@ -41,9 +41,11 @@ SYSTEM_PROMPT = """
 """
 
 
-LOGICAL_INPUT_INSTRUCTION_VERSION = "b3.4b-v1"
+LOGICAL_INPUT_INSTRUCTION_VERSION = "b3.6-v1"
 
-LOGICAL_INPUT_INSTRUCTION = """
+# B3.4b 基线 Logical 指令（不含 B3.6 低频参数族强制覆盖）。
+# A/B 归因时保持结构改动与 Prompt 改动可分离。
+LOGICAL_INPUT_INSTRUCTION_BASE = """
 本次输入中的部分或全部表格来自 Logical 恢复结果。
 columns 含 logical_row_id、source_row_indices、
 source_cell_ids；rows 每行对应一个逻辑行。
@@ -129,6 +131,50 @@ name 使用规范参数名，不要用符号、表头或身份描述替代：
 
 以上规则适用于一般 LDO Datasheet；不要假设任何
 特定型号的参数值、阈值或测试条件。
+"""
+
+
+# B3.6：针对 B3.5d 归因出的 26 条 LLM 遗漏
+# （line/load regulation、shutdown、short-circuit、noise）。
+# 只强化“有值必须输出”，不新增任何参数、数值或条件。
+LOGICAL_FAMILY_COVERAGE = """
+五、低频参数族的强制覆盖与自检
+以下参数族在历史基线中容易整行遗漏；只要当前
+逻辑行存在有效 min/typ/max 数值，就必须输出：
+1. line_regulation（单位常为 %/V 或 %）
+2. load_regulation（单位常为 %/A 或 mV）
+3. shutdown_current（Shutdown/Standby；保留
+   VEN/ENABLE 关断条件）
+4. short_circuit_current_limit（Short-circuit；
+   保留 VOUT = 0V 等条件；不得与
+   output_current_limit 合并）
+5. output_voltage_noise（保留 No Load、频率带宽、
+   COUT 等条件）
+同一逻辑行的 min/typ/max 仍按第三节分别输出。
+输出前按 logical_row_id 重新扫描：含有效数值的行
+必须有输出；发现遗漏先补齐再结束；不得新增输入
+中不存在的行、数值或条件。
+"""
+
+LOGICAL_INPUT_INSTRUCTION = (
+    LOGICAL_INPUT_INSTRUCTION_BASE
+    + LOGICAL_FAMILY_COVERAGE
+)
+
+
+# Flat 路径在 B3.6 A/B 中作为“仅 Prompt”对照臂使用。
+# 未启用时 transcript 与 B3.5c 完全一致。
+FLAT_FAMILY_COVERAGE = """
+低频参数族补充要求（仍只依据表格原文）：
+只要表格行存在有效 min/typ/max，必须输出以下参数，
+不得因不常见而跳过：
+1. line_regulation（%/V 或 %）
+2. load_regulation（%/A 或 mV）
+3. shutdown_current（Shutdown/Standby）
+4. short_circuit_current_limit（Short-circuit；
+   不得与 output_current_limit 合并）
+5. output_voltage_noise（Output Noise）
+不得新增表格中不存在的参数、数值或条件。
 """
 
 

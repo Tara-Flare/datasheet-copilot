@@ -46,7 +46,8 @@ def test_flat_and_retry_prompts_unchanged():
 
 
 def test_logical_prompt_changed_for_b34b():
-    assert prompts.LOGICAL_INPUT_INSTRUCTION_VERSION == "b3.4b-v1"
+    # B3.6 起版本升级到 b3.6-v1，仍保持与 B3.4a 的差异。
+    assert prompts.LOGICAL_INPUT_INSTRUCTION_VERSION == "b3.6-v1"
     assert (
         sha256_text(prompts.LOGICAL_INPUT_INSTRUCTION)
         != B34A_LOGICAL_INPUT_SHA256
@@ -133,16 +134,21 @@ def test_logical_prompt_is_general_ldo_not_tps7a02_specific():
 
 def test_logical_prompt_size_budget():
     # B3.4a 为 674 字符；B3.4b 允许增加完整性规则，
-    # 但必须控制 Prompt Token 开销。
-    assert len(prompts.LOGICAL_INPUT_INSTRUCTION) <= 2600
+    # B3.6 增加低频参数族强制覆盖与逐行自检，
+    # 但仍必须控制 Prompt Token 开销。
+    assert len(prompts.LOGICAL_INPUT_INSTRUCTION) <= 2800
 
 
-def _capture_chunk_instruction(table):
+def _capture_chunk_instruction(
+    table,
+    family_coverage=False,
+):
     extractor = DeepSeekExtractor.__new__(
         DeepSeekExtractor
     )
     extractor.rows_per_chunk = 10
     extractor.max_split_depth = 6
+    extractor.family_coverage = family_coverage
     captured = {}
 
     def fake_request_json(payload, instruction):
@@ -195,9 +201,11 @@ def test_logical_instruction_only_injected_for_logical_tables():
         prompts.LOGICAL_INPUT_INSTRUCTION
         not in flat["instruction"]
     )
+    # B3.6：默认关闭低频参数族覆盖，
+    # 保证 B3.5c 基线 Logical Prompt 可复现。
     assert logical["instruction"] == (
         EXTRACT_INSTRUCTION
-        + prompts.LOGICAL_INPUT_INSTRUCTION
+        + prompts.LOGICAL_INPUT_INSTRUCTION_BASE
     )
     assert (
         logical["payload"]["tables"][0]["input_mode"]

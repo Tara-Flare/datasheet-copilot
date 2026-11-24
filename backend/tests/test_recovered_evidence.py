@@ -15,6 +15,8 @@ from app.validation.recovered_evidence import (
 )
 
 
+pytestmark = pytest.mark.requires_data
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXTRACTION_PATH = (
     PROJECT_ROOT
@@ -32,6 +34,12 @@ RAW_PATH = (
     PROJECT_ROOT
     / "data/outputs/TPS7A02.raw_structure.v1.json"
 )
+
+if not EXTRACTION_PATH.is_file():
+    pytest.skip(
+        "缺少本地 data/ fixtures；见 docs/DATA_LAYOUT.md",
+        allow_module_level=True,
+    )
 
 EXTRACTION_SHA_AT_IMPORT = hashlib.sha256(
     EXTRACTION_PATH.read_bytes()

@@ -13,6 +13,8 @@ from app.validation.recovered_evidence import (
 )
 
 
+pytestmark = pytest.mark.requires_data
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 V1_PATH = (
     PROJECT_ROOT / "data/outputs/TPS7A02.logical_rows.v1.json"

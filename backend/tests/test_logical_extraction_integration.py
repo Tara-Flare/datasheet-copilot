@@ -46,6 +46,8 @@ RAW_PATH = (
 )
 CACHE_DIR = PROJECT_ROOT / "data/cache/docling"
 
+pytestmark = pytest.mark.requires_data
+
 
 def load(path):
     return json.loads(path.read_text(encoding="utf-8"))

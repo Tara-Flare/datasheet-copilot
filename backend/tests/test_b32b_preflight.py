@@ -44,6 +44,8 @@ from test_logical_extraction_integration import (
 )
 
 
+pytestmark = pytest.mark.requires_data
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGICAL_PATH = (
     PROJECT_ROOT / "data/outputs/TPS7A02.logical_rows.v1.json"

@@ -8,14 +8,20 @@ from fastapi.concurrency import run_in_threadpool
 from app.parsers.pdf_parser import PDFParser
 from app.parsers.table_parser import TableParser
 
-from app.extraction.extractor import ParameterExtractor
-from app.extraction.evidence import verify_evidence
+from app.pipeline import (
+    configure_docling_environment,
+    parse_table_ids,
+    run_pipeline,
+)
+
+
+configure_docling_environment()
 
 
 app = FastAPI(
     title="Datasheet Copilot API",
     description="电子元器件 Datasheet 智能解析系统",
-    version="0.1.0"
+    version="1.0.0"
 )
 
 parser = PDFParser()
@@ -41,10 +47,16 @@ def health():
 @app.post("/api/v1/documents/parse")
 async def parse_document(
     file: UploadFile = File(...),
-    extract: bool = False
+    extract: bool = False,
+    profile: str = None,
+    table_ids: str = None,
 ):
     """
     上传 PDF 并返回解析结果。
+
+    extract=true 时使用真实生产链路：
+    - 默认 D（Logical + P1 + recovered）
+    - profile=c 可切换 C（Flat + P1 + legacy）
     """
 
     filename = Path(file.filename or "").name
@@ -81,57 +93,62 @@ async def parse_document(
                         detail="文件不是有效的 PDF"
                     )
 
-            # 1. PyMuPDF 提取文本与位置
+            if extract:
+                # 真实生产链路：StructureRecovery +
+                # LogicalTableAdapter + DeepSeek + Validator。
+                # 只解析一次 PDF，避免 Docling 重复运行。
+                run = await run_in_threadpool(
+                    run_pipeline,
+                    str(pdf_path),
+                    profile=profile,
+                    table_ids=parse_table_ids(table_ids),
+                )
+
+                result = {
+                    "filename": filename,
+                    "page_count": run["pdf_document"][
+                        "page_count"
+                    ],
+                    "pages": run["pdf_document"]["pages"],
+                    "table_count": len(
+                        run["runtime"]["all_tables"]
+                    ),
+                    "tables": run["runtime"]["all_tables"],
+                    "extraction": run["validation"],
+                    "auto_accept": run["summary"][
+                        "auto_accepted_parameters"
+                    ],
+                    "pending_review": run["summary"][
+                        "pending_parameters"
+                    ],
+                    "invalid": run["summary"][
+                        "invalid_parameters"
+                    ],
+                    "pipeline": run["diagnostics"],
+                    "status": "extracted",
+                }
+
+                return result
+
+            # 只解析、不提取时保持原有轻量返回结构。
             text_result = await run_in_threadpool(
                 parser.parse,
                 str(pdf_path)
             )
 
-            # 2. Docling 识别表格结构
             table_result = await run_in_threadpool(
                 table_parser.parse,
                 str(pdf_path)
             )
 
-            # 3. 合并解析结果
-            result = {
+            return {
                 "filename": filename,
                 "page_count": text_result["page_count"],
                 "table_count": table_result["table_count"],
                 "pages": text_result["pages"],
                 "tables": table_result["tables"],
-                "status": "parsed"
+                "status": "parsed",
             }
-            if extract:
-                # 使用环境变量创建模型客户端
-                extractor = ParameterExtractor()
-
-                # 对表格进行参数提取
-                extraction = await run_in_threadpool(
-                    extractor.extract,
-                    result["tables"]
-                )
-
-                # 检查参数来源
-                verified = verify_evidence(
-                    extraction,
-                    result["tables"]
-                )
-                validator = ParameterValidator()
-
-                validated_result = validator.validate(
-                    verified
-                )
-
-                result["extraction"] = validated_result
-
-                
-
-                result["status"] = "extracted"
-
-            result["filename"] = filename
-
-            return result
 
     except HTTPException:
         raise

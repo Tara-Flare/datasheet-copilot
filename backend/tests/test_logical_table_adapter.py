@@ -18,6 +18,8 @@ from app.extraction.logical_table_adapter import (
 )
 
 
+pytestmark = pytest.mark.requires_data
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGICAL_PATH = (
     PROJECT_ROOT

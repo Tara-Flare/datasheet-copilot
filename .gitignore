@@ -24,9 +24,21 @@ docling-models/
 docling-models.tar.gz
 
 # PDF 样本、缓存和实验产物
-data/samples/*.pdf
+data/**/*.pdf
 data/cache/
-data/outputs/
+data/outputs*/
+
+# 覆盖率与编辑器本地文件
+coverage.xml
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# 大型模型权重与运行文件
+*.safetensors
+*.onnx
+*.extraction.json
 
 # 日志及系统文件
 *.log
